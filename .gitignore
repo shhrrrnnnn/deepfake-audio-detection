@@ -1,0 +1,6 @@
+data/
+cache/
+__pycache__/
+*.pyc
+output/*.png
+temp_*.wav
