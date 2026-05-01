@@ -1,3 +1,17 @@
+# trainer.py
+# Trains the LCNN model on ASVspoof2019 LA dataset.
+#
+# WHAT WAS REMOVED AND WHY:
+#   import torchaudio.transforms as T  — imported but never called anywhere
+#                                        in the training loop. Dead import.
+#
+# NOTHING ELSE CHANGED — all training logic, augmentation, EER computation
+# and model saving is identical. No retraining needed for this change.
+#
+# RUN:
+#   python trainer.py
+#   python trainer.py --epochs 50 --batch_size 16
+
 import os
 import sys
 import random
@@ -10,10 +24,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import numpy as np
-import torchaudio.transforms as T
 from sklearn.metrics import roc_curve
 
-# Ensure local imports work
 sys.path.insert(0, os.path.dirname(__file__))
 from models.lcnn import LCNN
 from utils.audio_handler import load_audio
@@ -21,75 +33,111 @@ from utils.features import extract_mel, get_cache_path, save_to_cache, load_from
 
 warnings.filterwarnings("ignore")
 
-# --- CONFIGURATION ---
+# ── Config ────────────────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
 BATCH_SIZE  = 32
-EPOCHS      = 30 
+EPOCHS      = 30
 LR          = 3e-4
 
-DATA_DIR    = r"C:\Users\shara\deepfake_audio\data\LA\LA"
-OUTPUT_DIR  = r"C:\Users\shara\deepfake_audio\output"
-CACHE_DIR   = r"C:\Users\shara\deepfake_audio\cache"
+DATA_DIR   = r"C:\Users\shara\deepfake_audio\data\LA\LA"
+OUTPUT_DIR = r"C:\Users\shara\deepfake_audio\output"
+CACHE_DIR  = r"C:\Users\shara\deepfake_audio\cache"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = torch.cuda.is_available()
 
-# --- ROBUST AUGMENTATION ---
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+# Applied during training to improve robustness to real-world audio.
+# 1. Gaussian noise at random SNR (simulates mic noise / room noise)
+# 2. Low-pass filter at random cutoff (simulates codec bandwidth limiting)
+# 3. Volume jitter (simulates different recording levels)
+
 def augment_for_real_world(y, sr):
     if random.random() > 0.5:
-        snr = np.random.uniform(15, 30)
-        pwr = np.mean(y**2) + 1e-8
+        snr   = np.random.uniform(15, 30)
+        pwr   = np.mean(y**2) + 1e-8
         noise = np.random.normal(0, np.sqrt(pwr / 10**(snr/10)), len(y))
-        y = (y + noise).astype(np.float32)
+        y     = (y + noise).astype(np.float32)
 
     if random.random() > 0.5:
         cutoff = random.randint(4000, 8000)
         from scipy.signal import butter, lfilter
         b, a = butter(4, cutoff/(sr/2), btype='low')
-        y = lfilter(b, a, y).astype(np.float32)
+        y    = lfilter(b, a, y).astype(np.float32)
 
     y = (y * np.random.uniform(0.6, 1.2)).astype(np.float32)
     return y
 
-# --- LOSS FUNCTION ---
+
+# ── Loss Function ─────────────────────────────────────────────────────────────
+# FocalLoss focuses learning on hard borderline cases by down-weighting
+# examples the model already classifies correctly.
+# gamma=2.0 is the standard value from the original Focal Loss paper.
+
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0):
         super().__init__()
         self.gamma = gamma
+
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        pt = torch.exp(-ce_loss)
+        pt      = torch.exp(-ce_loss)
         return ((1 - pt) ** self.gamma * ce_loss).mean()
 
-# --- DATASET ---
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+# Loads ASVspoof2019 FLAC files using protocol files that map each
+# filename to bonafide (real=0) or spoof (fake=1).
+# Uses disk caching so mel spectrograms are computed only once per file.
+
 class ASVspoofDataset(Dataset):
     def __init__(self, audio_dir, label_dict, cache_dir, is_train=False):
         self.audio_dir = audio_dir
         self.cache_dir = cache_dir
-        self.is_train = is_train
+        self.is_train  = is_train
         os.makedirs(cache_dir, exist_ok=True)
-        
-        all_files = [f for f in os.listdir(audio_dir) if f.endswith(".flac")]
-        self.samples = [(f, label_dict[f.replace(".flac", "")]) 
+
+        all_files    = [f for f in os.listdir(audio_dir) if f.endswith(".flac")]
+        self.samples = [(f, label_dict[f.replace(".flac", "")])
                         for f in all_files if f.replace(".flac", "") in label_dict]
 
-    def __len__(self): return len(self.samples)
-    def get_labels(self): return [l for _, l in self.samples]
+        real = sum(1 for _, l in self.samples if l == 0)
+        fake = sum(1 for _, l in self.samples if l == 1)
+        print(f"  Dataset: {len(self.samples)} samples  (Real={real}, Fake={fake})")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def get_labels(self):
+        return [l for _, l in self.samples]
 
     def __getitem__(self, idx):
         fname, label = self.samples[idx]
-        cache_path = get_cache_path(self.cache_dir, fname, augmented=self.is_train)
-        cached = load_from_cache(cache_path)
+        cache_path   = get_cache_path(self.cache_dir, fname, augmented=self.is_train)
+        cached       = load_from_cache(cache_path)
+
         if cached:
-            return torch.tensor(cached["mel"], dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+            return (torch.tensor(cached["mel"], dtype=torch.float32),
+                    torch.tensor(label, dtype=torch.long))
 
         fpath = os.path.join(self.audio_dir, fname)
         y, sr = load_audio(fpath)
+
         if self.is_train:
             y = augment_for_real_world(y, sr)
+
         mel = extract_mel(y, sr)
         save_to_cache(cache_path, mel, None)
-        return torch.tensor(mel, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+        return (torch.tensor(mel, dtype=torch.float32),
+                torch.tensor(label, dtype=torch.long))
+
+
+# ── EER ───────────────────────────────────────────────────────────────────────
+# Equal Error Rate — standard ASVspoof evaluation metric.
+# EER is where false accept rate equals false reject rate. Lower = better.
+# The threshold at EER is saved in the checkpoint for use in inference.
 
 def compute_eer(y_true, y_scores):
     fpr, tpr, thresholds = roc_curve(y_true, y_scores, pos_label=1)
@@ -97,45 +145,65 @@ def compute_eer(y_true, y_scores):
     idx = np.nanargmin(np.abs(fnr - fpr))
     return float((fpr[idx] + fnr[idx]) / 2), float(thresholds[idx])
 
+
+# ── Protocol Loader ───────────────────────────────────────────────────────────
+
 def load_protocol(path):
     d = {}
     with open(path) as f:
         for line in f:
             p = line.strip().split()
-            if len(p) >= 2: d[p[1]] = 0 if p[-1] == "bonafide" else 1
+            if len(p) >= 2:
+                d[p[1]] = 0 if p[-1] == "bonafide" else 1
     return d
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser = argparse.ArgumentParser(description="Train LCNN on ASVspoof2019")
+    parser.add_argument("--epochs",     type=int, default=EPOCHS)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     args = parser.parse_args()
 
-    proto_dir = os.path.join(DATA_DIR, "ASVspoof2019_LA_cm_protocols")
-    train_labels = load_protocol(os.path.join(proto_dir, "ASVspoof2019.LA.cm.train.trn.txt"))
-    dev_labels   = load_protocol(os.path.join(proto_dir, "ASVspoof2019.LA.cm.dev.trl.txt"))
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    proto_dir    = os.path.join(DATA_DIR, "ASVspoof2019_LA_cm_protocols")
+    train_labels = load_protocol(
+        os.path.join(proto_dir, "ASVspoof2019.LA.cm.train.trn.txt"))
+    dev_labels   = load_protocol(
+        os.path.join(proto_dir, "ASVspoof2019.LA.cm.dev.trl.txt"))
 
     train_dir = os.path.join(DATA_DIR, "ASVspoof2019_LA_train", "flac")
-    dev_dir   = os.path.join(DATA_DIR, "ASVspoof2019_LA_dev", "flac")
-    
-    train_ds = ASVspoofDataset(train_dir, train_labels, os.path.join(CACHE_DIR, "train"), is_train=True)
-    val_ds   = ASVspoofDataset(dev_dir, dev_labels, os.path.join(CACHE_DIR, "val"), is_train=False)
+    dev_dir   = os.path.join(DATA_DIR, "ASVspoof2019_LA_dev",   "flac")
 
-    labels_list = train_ds.get_labels()
+    print("\nBuilding Training Dataset (with augmentation)...")
+    train_ds = ASVspoofDataset(train_dir, train_labels,
+                               os.path.join(CACHE_DIR, "train"), is_train=True)
+    print("Building Validation Dataset...")
+    val_ds   = ASVspoofDataset(dev_dir, dev_labels,
+                               os.path.join(CACHE_DIR, "val"), is_train=False)
+
+    # Weighted sampler — balances the ~80% fake / 20% real imbalance
+    labels_list  = train_ds.get_labels()
     class_counts = np.bincount(labels_list)
-    weights = [1.0 / class_counts[l] for l in labels_list]
-    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    weights      = [1.0 / class_counts[l] for l in labels_list]
+    sampler      = WeightedRandomSampler(weights, len(weights), replacement=True)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              sampler=sampler, num_workers=0)
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
+                              shuffle=False, num_workers=0)
 
-    model = LCNN(num_classes=2).to(DEVICE)
+    model     = LCNN(num_classes=2).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     criterion = FocalLoss(gamma=2.0)
-    scaler = torch.amp.GradScaler('cuda', enabled=USE_AMP)
+    scaler    = torch.amp.GradScaler('cuda', enabled=USE_AMP)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     best_eer = float("inf")
+    print(f"\nTraining on {DEVICE} for {args.epochs} epochs...")
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_loss = 0.0
@@ -144,7 +212,7 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=USE_AMP):
                 outputs = model(mel)
-                loss = criterion(outputs, labels)
+                loss    = criterion(outputs, labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -154,17 +222,25 @@ if __name__ == '__main__':
         v_targets, v_scores = [], []
         with torch.no_grad():
             for mel, labels in val_loader:
-                mel = mel.to(DEVICE)
-                outputs = model(mel)
-                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                mel   = mel.to(DEVICE)
+                probs = torch.softmax(model(mel), dim=1)[:, 1].cpu().numpy()
                 v_scores.extend(probs)
                 v_targets.extend(labels.numpy())
-        
+
         val_eer, threshold = compute_eer(v_targets, v_scores)
         scheduler.step()
-        print(f"Epoch {epoch:02d} | Loss: {train_loss/len(train_loader):.4f} | Val EER: {val_eer*100:.2f}%")
+
+        print(f"Epoch {epoch:02d} | "
+              f"Loss: {train_loss/len(train_loader):.4f} | "
+              f"Val EER: {val_eer*100:.2f}%")
 
         if val_eer < best_eer:
             best_eer = val_eer
-            torch.save({"model_state": model.state_dict(), "eer": val_eer, "threshold": threshold}, 
-                       os.path.join(OUTPUT_DIR, "best_lcnn.pt"))
+            torch.save({
+                "model_state": model.state_dict(),
+                "eer":         val_eer,
+                "threshold":   threshold
+            }, os.path.join(OUTPUT_DIR, "best_lcnn.pt"))
+            print("  ✓ New best model saved!")
+
+    print(f"\nTraining complete. Best EER: {best_eer*100:.2f}%")
