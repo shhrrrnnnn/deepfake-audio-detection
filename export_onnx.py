@@ -84,25 +84,3 @@ if __name__ == '__main__':
             np.array([checkpoint.get("threshold", 0.5)]))
     print("EER threshold saved ✅")
 ```
-
----
-
-Now run this in terminal to set everything up and start training:
-```
-mkdir C:\Users\shara\deepfake_audio
-mkdir C:\Users\shara\deepfake_audio\models
-mkdir C:\Users\shara\deepfake_audio\utils
-mkdir C:\Users\shara\deepfake_audio\output
-mkdir C:\Users\shara\deepfake_audio\cache
-
-echo. > C:\Users\shara\deepfake_audio\models\__init__.py
-echo. > C:\Users\shara\deepfake_audio\utils\__init__.py
-
-cd C:\Users\shara\deepfake_audio
-python trainer.py
-```
-
-Once training finishes:
-```
-python export_onnx.py
-python app_inference.py path\to\any\audio.mp3
